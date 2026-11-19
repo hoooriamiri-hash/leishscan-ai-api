@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       lesion_url:
-        description: 'Lesion image URL or base64'
+        description: 'Lesion image URL'
         required: true
       microscopy_url:
-        description: 'Microscopy image URL or base64'
+        description: 'Microscopy image URL'
         required: true
       request_id:
         description: 'Unique Request ID'
@@ -16,6 +16,9 @@ on:
 jobs:
   run-inference:
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,21 +32,18 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Prediction
+      - name: Run Prediction & Post Result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python -c "
-          import urllib.request, json, os
+          import urllib.request, json
           from inference import predict
           urllib.request.urlretrieve('${{ github.event.inputs.lesion_url }}', 'lesion.jpg')
           urllib.request.urlretrieve('${{ github.event.inputs.microscopy_url }}', 'micro.jpg')
           with open('lesion.jpg', 'rb') as f1, open('micro.jpg', 'rb') as f2:
               res = predict(f1.read(), f2.read())
-          with open('result_${{ github.event.inputs.request_id }}.json', 'w') as out:
+          with open('out.json', 'w') as out:
               json.dump(res, out)
           "
-
-      - name: Upload Result Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: prediction-${{ github.event.inputs.request_id }}
-          path: result_${{ github.event.inputs.request_id }}.json
+          gh issue create --title "RESULT-${{ github.event.inputs.request_id }}" --body-file out.json
