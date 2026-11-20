@@ -1,6 +1,8 @@
 name: LeishScan AI Inference
 
 on:
+  schedule:
+    - cron: '0 0 */4 * *'
   workflow_dispatch:
     inputs:
       lesion_url:
@@ -22,27 +24,49 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Cache pre-built virtual environment
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-py310-${{ hashFiles('requirements.txt') }}
+
+      - name: Build virtual environment (only on cache miss)
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install --no-cache-dir -r requirements.txt
+
+      - name: Warm-up ping (scheduled keep-alive)
+        if: github.event_name == 'schedule'
+        run: .venv/bin/python -c "import torch, ultralytics; print('Cache kept alive!')"
 
       - name: Run Prediction & Post Result
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python -c "
+          .venv/bin/python -c "
           import urllib.request, json
+          from concurrent.futures import ThreadPoolExecutor
           from inference import predict
-          urllib.request.urlretrieve('${{ github.event.inputs.lesion_url }}', 'lesion.jpg')
-          urllib.request.urlretrieve('${{ github.event.inputs.microscopy_url }}', 'micro.jpg')
-          with open('lesion.jpg', 'rb') as f1, open('micro.jpg', 'rb') as f2:
-              res = predict(f1.read(), f2.read())
+
+          with ThreadPoolExecutor(max_workers=2) as ex:
+              f1 = ex.submit(urllib.request.urlretrieve, '${{ github.event.inputs.lesion_url }}', 'lesion.jpg')
+              f2 = ex.submit(urllib.request.urlretrieve, '${{ github.event.inputs.microscopy_url }}', 'micro.jpg')
+              f1.result(); f2.result()
+
+          with open('lesion.jpg', 'rb') as img1, open('micro.jpg', 'rb') as img2:
+              res = predict(img1.read(), img2.read())
           with open('out.json', 'w') as out:
               json.dump(res, out)
           "
