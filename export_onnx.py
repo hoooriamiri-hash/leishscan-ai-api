@@ -24,7 +24,7 @@ def build_densenet(sd):
 # 1. Export all 5 DenseNet121 lesion folds to ONNX
 dummy_lesion = torch.randn(1, 3, 256, 256)
 for f in sorted(glob.glob(str(BASE / "lesion" / "best_model_fold*.pt"))):
-    ck = torch.load(f, map_location="cpu")
+    ck = torch.load(f, map_location="cpu", weights_only=False)
     sd = ck.get("model_state_dict", ck.get("state_dict", ck)) if isinstance(ck, dict) else ck
     sd = {k.replace("module.", ""): v for k, v in sd.items()}
     model = build_densenet(sd)
@@ -39,6 +39,7 @@ for f in sorted(glob.glob(str(BASE / "lesion" / "best_model_fold*.pt"))):
         output_names=["logits"],
         opset_version=14,
         do_constant_folding=True,
+        dynamo=False,
     )
     print(f"Exported {out_path.name}")
 
