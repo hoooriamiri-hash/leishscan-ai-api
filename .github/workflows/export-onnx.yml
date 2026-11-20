@@ -1,4 +1,4 @@
-name: Export PyTorch Models to ONNX
+name: Export Models to ONNX
 
 on:
   workflow_dispatch:
@@ -14,25 +14,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install CPU PyTorch & ONNX dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install torch torchvision ultralytics onnx onnxslim
+          pip install torch torchvision --index-url https://pytorch.org
+          pip install -r requirements.txt
+          pip install onnx onnxruntime onnxslim onnxscript ultralytics
 
-      - name: Run ONNX export script
+      - name: Run export_onnx.py
         run: |
           python export_onnx.py
+          ls -lh onnx_models/
 
       - name: Commit and push ONNX models
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.email "github-actions[bot]@://github.com"
           git config --local user.name "github-actions[bot]"
-          git add onnx_models/
-          git diff --staged --quiet || git commit -m "chore: export 6 models to ONNX for browser inference"
-          git push
+          git add onnx_models/*.onnx
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Export DenseNet121 and YOLOv8n models to ONNX" && git push)
