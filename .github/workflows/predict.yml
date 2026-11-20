@@ -1,6 +1,10 @@
 name: LeishScan AI Inference
 
 on:
+  push:
+    paths:
+      - '.github/workflows/predict.yml'
+      - 'requirements.txt'
   schedule:
     - cron: '0 0 */4 * *'
   workflow_dispatch:
@@ -15,6 +19,13 @@ on:
         description: 'Unique Request ID'
         required: true
 
+env:
+  OMP_NUM_THREADS: '4'
+  MKL_NUM_THREADS: '4'
+  ULTRALYTICS_CONFIG_DIR: /tmp/Ultralytics
+  YOLO_VERBOSE: 'False'
+  PYTHONDONTWRITEBYTECODE: '0'
+
 jobs:
   run-inference:
     runs-on: ubuntu-latest
@@ -27,33 +38,35 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Cache pre-built virtual environment
+      - name: Restore slim CPU environment
         id: cache-venv
         uses: actions/cache@v4
         with:
-          path: .venv
-          key: venv-py310-${{ hashFiles('requirements.txt') }}
+          path: |
+            .venv
+            /tmp/Ultralytics
+          key: slim-cpu-venv-v2-${{ hashFiles('requirements.txt') }}
 
-      - name: Build virtual environment (only on cache miss)
+      - name: Build slim CPU environment (only on cache miss)
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: |
-          python -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install --no-cache-dir -r requirements.txt
+          python3 -m venv .venv
+          .venv/bin/pip install --no-cache-dir --upgrade pip
+          .venv/bin/pip install --no-cache-dir torch torchvision --index-url https://pytorch.org
+          .venv/bin/pip install --no-cache-dir opencv-python-headless
+          .venv/bin/pip install --no-cache-dir -r requirements.txt --index-url https://pytorch.org --extra-index-url https://pypi.org
+          .venv/bin/pip uninstall -y opencv-python || true
+          .venv/bin/pip install --no-cache-dir --force-reinstall opencv-python-headless
+          mkdir -p /tmp/Ultralytics
+          .venv/bin/python -c "from ultralytics import YOLO; YOLO('microscopy/best.pt')"
+          .venv/bin/python -m compileall -q .venv
 
-      - name: Warm-up ping (scheduled keep-alive)
-        if: github.event_name == 'schedule'
-        run: .venv/bin/python -c "import torch, ultralytics; print('Cache kept alive!')"
+      - name: Warm-up ping (push or scheduled keep-alive)
+        if: github.event_name != 'workflow_dispatch'
+        run: .venv/bin/python -c "import torch, ultralytics; print('Slim cache ready!')"
 
       - name: Run Prediction & Post Result
         if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           .venv/bin/python -c "
           import urllib.request, json
@@ -62,12 +75,27 @@ jobs:
 
           with ThreadPoolExecutor(max_workers=2) as ex:
               f1 = ex.submit(urllib.request.urlretrieve, '${{ github.event.inputs.lesion_url }}', 'lesion.jpg')
-              f2 = ex.submit(urllib.request.urlretrieve, '${{ github.event.inputs.microscopy_url }}', 'micro.jpg')
+              f2 = ex.submit(urllib.request.urlretrieve, '${{ github.event.inputs.microscopy_url }}', 'microscopy.jpg')
               f1.result(); f2.result()
 
-          with open('lesion.jpg', 'rb') as img1, open('micro.jpg', 'rb') as img2:
+          with open('lesion.jpg', 'rb') as img1, open('microscopy.jpg', 'rb') as img2:
               res = predict(img1.read(), img2.read())
-          with open('out.json', 'w') as out:
-              json.dump(res, out)
+
+          payload = json.dumps({
+              'title': 'RESULT-${{ github.event.inputs.request_id }}',
+              'body': json.dumps(res)
+          }).encode('utf-8')
+
+          req = urllib.request.Request(
+              'https://github.com{{ github.repository }}/issues',
+              data=payload,
+              headers={
+                  'Authorization': 'Bearer ${{ secrets.GITHUB_TOKEN }}',
+                  'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'Content-Type': 'application/json'
+              },
+              method='POST'
+          )
+          urllib.request.urlopen(req)
           "
-          gh issue create --title "RESULT-${{ github.event.inputs.request_id }}" --body-file out.json
