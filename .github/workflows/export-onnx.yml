@@ -17,7 +17,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
@@ -32,7 +32,7 @@ jobs:
 
       - name: Commit and push ONNX models
         run: |
-          git config --local user.email "github-actions[bot]@://github.com"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add onnx_models/
           git diff --staged --quiet || git commit -m "chore: export 6 models to ONNX for browser inference"
