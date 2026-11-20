@@ -24,7 +24,6 @@ env:
   MKL_NUM_THREADS: '4'
   ULTRALYTICS_CONFIG_DIR: /tmp/Ultralytics
   YOLO_VERBOSE: 'False'
-  PYTHONDONTWRITEBYTECODE: '0'
 
 jobs:
   run-inference:
@@ -38,44 +37,33 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Restore slim CPU environment
-        id: cache-venv
-        uses: actions/cache@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
         with:
-          path: |
-            .venv
-            /tmp/Ultralytics
-          key: slim-cpu-venv-v2-${{ hashFiles('requirements.txt') }}
+          python-version: '3.10'
+          cache: 'pip'
 
-      - name: Build slim CPU environment (only on cache miss)
-        if: steps.cache-venv.outputs.cache-hit != 'true'
+      - name: Install slim CPU dependencies
         run: |
-          python3 -m venv .venv
-          .venv/bin/pip install --no-cache-dir --upgrade pip
-          .venv/bin/pip install --no-cache-dir torch torchvision --index-url https://pytorch.org
-          .venv/bin/pip install --no-cache-dir opencv-python-headless
-          .venv/bin/pip install --no-cache-dir -r requirements.txt --index-url https://pytorch.org --extra-index-url https://pypi.org
-          .venv/bin/pip uninstall -y opencv-python || true
-          .venv/bin/pip install --no-cache-dir --force-reinstall opencv-python-headless
+          pip install --quiet torch torchvision --index-url https://pytorch.org
+          pip install --quiet -r requirements.txt
           mkdir -p /tmp/Ultralytics
-          .venv/bin/python -c "from ultralytics import YOLO; YOLO('microscopy/best.pt')"
-          .venv/bin/python -m compileall -q .venv
 
       - name: Warm-up ping (push or scheduled keep-alive)
         if: github.event_name != 'workflow_dispatch'
-        run: .venv/bin/python -c "import torch, ultralytics; print('Slim cache ready!')"
+        run: python -c "import torch, ultralytics; print('Slim CPU cache active!')"
 
       - name: Run Prediction & Post Result
         if: github.event_name == 'workflow_dispatch'
         run: |
-          .venv/bin/python -c "
+          python -c "
           import urllib.request, json
           from concurrent.futures import ThreadPoolExecutor
           from inference import predict
 
           with ThreadPoolExecutor(max_workers=2) as ex:
               f1 = ex.submit(urllib.request.urlretrieve, '${{ github.event.inputs.lesion_url }}', 'lesion.jpg')
-              f2 = ex.submit(urllib.request.urlretrieve, '${{ github.event.inputs.microscopy_url }}', 'microscopy.jpg')
+              f2 = ex.submit(urllib.request.urlretrieve, '${{ github.event.inputs.microscopy_url }}', 'micro.jpg')
               f1.result(); f2.result()
 
           with open('lesion.jpg', 'rb') as img1, open('microscopy.jpg', 'rb') as img2:
