@@ -14,11 +14,9 @@ YOLO_IOU = 0.45              # NMS IoU threshold
 LESION_SIZE = 256
 YOLO_IMGSZ = 1024
 
-# ImageNet normalization constants matching torchvision transforms.Normalize
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
 
-# Optimize CPU execution threads
 _sess_opts = ort.SessionOptions()
 _sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
@@ -62,7 +60,6 @@ def _sigmoid(x):
 def predict_lesion(img):
     pil_img = _load_img(img).resize((LESION_SIZE, LESION_SIZE), Image.BILINEAR)
     arr = np.asarray(pil_img, dtype=np.float32) / 255.0
-    # HWC -> NCHW
     x = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
     x = (x - MEAN) / STD
 
@@ -117,9 +114,8 @@ def predict_parasite(img):
     x = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
 
     input_name = _yolo_session.get_inputs()[0].name
-    raw_out = _yolo_session.run(None, {input_name: x})[0]  # shape: (1, 4 + num_classes, num_anchors)
+    raw_out = _yolo_session.run(None, {input_name: x})[0]
 
-    # Transpose to (num_anchors, 4 + num_classes)
     preds = np.squeeze(raw_out, axis=0).T
     boxes_xywh = preds[:, :4]
     class_scores = preds[:, 4:]
@@ -135,7 +131,6 @@ def predict_parasite(img):
     if len(boxes_xywh) == 0:
         return 0, []
 
-    # Convert cx, cy, w, h -> x1, y1, x2, y2 in letterbox coords
     boxes_xyxy = np.zeros_like(boxes_xywh)
     boxes_xyxy[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2.0
     boxes_xyxy[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2.0
@@ -144,12 +139,10 @@ def predict_parasite(img):
 
     keep = _nms(boxes_xyxy, confidences, YOLO_IOU)
 
-    # Map class index 0 -> "amastigote" (adjust if your model has multiple classes)
     class_names = {0: "amastigote"}
     dets = []
     for idx in keep:
         b = boxes_xyxy[idx]
-        # Rescale back to original image coordinates
         x1 = max(0.0, min(float(orig_w), (float(b[0]) - dw) / ratio))
         y1 = max(0.0, min(float(orig_h), (float(b[1]) - dh) / ratio))
         x2 = max(0.0, min(float(orig_w), (float(b[2]) - dw) / ratio))
