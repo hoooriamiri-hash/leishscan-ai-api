@@ -26,10 +26,14 @@ jobs:
       issues: write
       contents: read
     steps:
-      - name: Checkout repository
+      - name: Checkout ONNX models & code only
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          sparse-checkout: |
+            inference.py
+            requirements.txt
+            onnx_models
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -38,11 +42,11 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install --no-cache-dir -r requirements.txt
 
       - name: Warm-up ping (push or scheduled keep-alive)
         if: github.event_name != 'workflow_dispatch'
-        run: python -c "import torch, ultralytics; print('Cache warmed and active!')"
+        run: python -c "import onnxruntime, numpy, PIL; print('ONNX cache warmed and active!')"
 
       - name: Run Prediction & Post Result
         if: github.event_name == 'workflow_dispatch'
