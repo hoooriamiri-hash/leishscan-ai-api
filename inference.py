@@ -1,61 +1,42 @@
 """LeishScan AI inference (pure ONNX Runtime, no torch/ultralytics).
 
 Clinical lesion (5-fold DenseNet121 ONNX ensemble) + Giemsa microscopy
-(YOLOv8n `microscopy_best.onnx`, 1-5 fields aggregated) -> System output.
+(YOLOv8n `microscopy_best.onnx`, 1-5 slides aggregated) -> System output.
+
+YOLO pre/post-processing mirrors Ultralytics `model.predict(imgsz=1024, conf, iou)`:
+RGB, /255, centred letterbox (pad 114, cv2 INTER_LINEAR), class-aware NMS,
+boxes mapped back to the original image.
+
+Local test (same code path as GitHub Actions):
+    python inference.py lesion.jpg slide1.jpg slide2.jpg slide3.jpg
 """
-import io, glob, ast
+import io, glob, ast, json, sys
 from pathlib import Path
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageOps
+
+try:
+    import cv2  # optional: gives bit-identical resizing to Ultralytics
+except Exception:  # pragma: no cover
+    cv2 = None
 
 BASE = Path(__file__).parent
 MODEL_DIR = BASE / "onnx_models"
 
-LESION_THRESHOLD = 0.25      # probability >= this => Clinical lesion = yes
+LESION_THRESHOLD = 0.25        # probability >= this => Clinical lesion = yes
 LESION_SIZE = 256
 LESION_OUTPUT_IS_LOGIT = True  # set False if your lesion ONNX files already end in a sigmoid
-YOLO_CONF = 0.25             # min detection confidence for amastigote
-YOLO_IOU = 0.7               # NMS IoU threshold (ultralytics default)
-YOLO_IMGSZ = 1024            # used only if the ONNX input size is dynamic
+YOLO_CONF = 0.25               # min detection confidence
+YOLO_IOU = 0.45                # NMS IoU (Ultralytics predict() default is 0.7 - change to match your local run)
+YOLO_IMGSZ = 1024              # used only if the ONNX input size is dynamic
 MAX_FIELDS = 5
-MAX_DETS_PER_FIELD = 40      # keeps the GitHub issue body small; counts are always exact
+MAX_DETS_PER_FIELD = 40        # keeps the GitHub issue body small; counts are always exact
 
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _PROVIDERS = ["CPUExecutionProvider"]
-
-
-def _load_img(x):
-    if isinstance(x, Image.Image):
-        return x.convert("RGB")
-    if isinstance(x, (bytes, bytearray)):
-        return Image.open(io.BytesIO(x)).convert("RGB")
-    return Image.open(x).convert("RGB")
-
-
-# ---------------- model loading ----------------
-def _load_lesion_sessions():
-    files = [f for f in sorted(glob.glob(str(MODEL_DIR / "*.onnx")))
-             if "microscopy" not in Path(f).name.lower()]
-    if not files:
-        raise FileNotFoundError("No lesion ONNX models found in onnx_models/")
-    return [ort.InferenceSession(f, providers=_PROVIDERS) for f in files]
-
-
-def _yolo_names(sess):
-    try:
-        raw = sess.get_modelmeta().custom_metadata_map.get("names")
-        return {int(k): str(v) for k, v in ast.literal_eval(raw).items()}
-    except Exception:
-        return {}
-
-
-_lesion_sessions = _load_lesion_sessions()
-_yolo = ort.InferenceSession(str(MODEL_DIR / "microscopy_best.onnx"), providers=_PROVIDERS)
-_yolo_in = _yolo.get_inputs()[0]
-_yolo_size = _yolo_in.shape[2] if isinstance(_yolo_in.shape[2], int) else YOLO_IMGSZ
-_yolo_names_map = _yolo_names(_yolo) or {0: "amastigote"}
+_S = {}
 
 OUTCOMES = {
     (True, True):   ("Suspected CL, parasites demonstrated",
@@ -69,6 +50,44 @@ OUTCOMES = {
 }
 
 
+def _load_img(x, exif=False):
+    if isinstance(x, Image.Image):
+        im = x
+    elif isinstance(x, (bytes, bytearray)):
+        im = Image.open(io.BytesIO(x))
+    else:
+        im = Image.open(x)
+    if exif:                      # cv2.imread (used by Ultralytics) honours EXIF orientation
+        im = ImageOps.exif_transpose(im)
+    return im.convert("RGB")
+
+
+def _models():
+    """Lazy-load all ONNX sessions once."""
+    if _S:
+        return _S
+    lesion_files = [f for f in sorted(glob.glob(str(MODEL_DIR / "*.onnx")))
+                    if "microscopy" not in Path(f).name.lower()]
+    if not lesion_files:
+        raise FileNotFoundError("No lesion ONNX models found in onnx_models/")
+    yolo = ort.InferenceSession(str(MODEL_DIR / "microscopy_best.onnx"), providers=_PROVIDERS)
+    yin = yolo.get_inputs()[0]
+    try:
+        names = {int(k): str(v) for k, v in
+                 ast.literal_eval(yolo.get_modelmeta().custom_metadata_map.get("names")).items()}
+    except Exception:
+        names = {}
+    _S.update(
+        lesion=[ort.InferenceSession(f, providers=_PROVIDERS) for f in lesion_files],
+        yolo=yolo, yin=yin,
+        size=yin.shape[2] if isinstance(yin.shape[2], int) else YOLO_IMGSZ,
+        fp16="float16" in yin.type, names=names,
+    )
+    print(f"[init] lesion folds={len(lesion_files)} yolo_input={yin.shape} type={yin.type} "
+          f"names={names or 'NOT IN METADATA'} cv2={'yes' if cv2 else 'no (PIL fallback)'}", flush=True)
+    return _S
+
+
 # ---------------- lesion (macroscopic) ----------------
 def _prep_lesion(img):
     a = np.asarray(img.resize((LESION_SIZE, LESION_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
@@ -79,22 +98,27 @@ def _prep_lesion(img):
 def predict_lesion(img):
     x = _prep_lesion(_load_img(img))
     probs = []
-    for s in _lesion_sessions:
+    for s in _models()["lesion"]:
         v = float(np.asarray(s.run(None, {s.get_inputs()[0].name: x})[0]).reshape(-1)[0])
         probs.append(1.0 / (1.0 + np.exp(-v)) if LESION_OUTPUT_IS_LOGIT else v)
     return sum(probs) / len(probs)
 
 
 # ---------------- microscopy (YOLOv8n ONNX) ----------------
-def _letterbox(img, size):
-    w, h = img.size
-    r = min(size / w, size / h)
+def _letterbox(arr, size):
+    """Ultralytics LetterBox(auto=False, center=True): returns CHW float batch, ratio, left, top."""
+    h, w = arr.shape[:2]
+    r = min(size / h, size / w)
     nw, nh = int(round(w * r)), int(round(h * r))
-    canvas = Image.new("RGB", (size, size), (114, 114, 114))
-    px, py = (size - nw) // 2, (size - nh) // 2
-    canvas.paste(img.resize((nw, nh), Image.BILINEAR), (px, py))
-    a = np.asarray(canvas, dtype=np.float32) / 255.0
-    return np.ascontiguousarray(a.transpose(2, 0, 1)[None]), r, px, py
+    dw, dh = (size - nw) / 2, (size - nh) / 2
+    if (w, h) != (nw, nh):
+        arr = (cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_LINEAR) if cv2
+               else np.asarray(Image.fromarray(arr).resize((nw, nh), Image.BILINEAR)))
+    top, left = int(round(dh - 0.1)), int(round(dw - 0.1))
+    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+    canvas[top:top + nh, left:left + nw] = arr
+    x = canvas.astype(np.float32) / 255.0                       # RGB, 0-1
+    return np.ascontiguousarray(x.transpose(2, 0, 1)[None]), r, left, top
 
 
 def _nms(boxes, scores, iou_thr):
@@ -109,65 +133,94 @@ def _nms(boxes, scores, iou_thr):
         xx1, yy1 = np.maximum(x1[i], x1[rest]), np.maximum(y1[i], y1[rest])
         xx2, yy2 = np.minimum(x2[i], x2[rest]), np.minimum(y2[i], y2[rest])
         inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[rest] - inter + 1e-9)
-        order = rest[iou <= iou_thr]
+        order = rest[inter / (areas[i] + areas[rest] - inter + 1e-9) <= iou_thr]
     return keep
 
 
-def _detect_field(img):
-    img = _load_img(img)
+def _is_target(cid, nc, names):
+    """Does this class id count as an amastigote?"""
+    if names:
+        n = names.get(cid, "").lower()
+        return len(names) == 1 or "amastigote" in n or "leish" in n
+    return nc == 1 or cid == 0   # no metadata: single-class model, else assume class 0
+
+
+def _detect_field(src):
+    S = _models()
+    img = _load_img(src, exif=True)
     W, H = img.size
-    x, r, px, py = _letterbox(img, _yolo_size)
-    out = _yolo.run(None, {_yolo_in.name: x})[0]
+    x, r, left, top = _letterbox(np.asarray(img), S["size"])
+    if S["fp16"]:
+        x = x.astype(np.float16)
+    out = np.asarray(S["yolo"].run(None, {S["yin"].name: x})[0], dtype=np.float32)
     p = out[0] if out.ndim == 3 else out
-    if p.shape[0] < p.shape[1]:          # (4+nc, N) -> (N, 4+nc)
-        p = p.T
-    scores = p[:, 4:]
-    cls = scores.argmax(1)
-    conf = scores.max(1)
-    m = conf >= YOLO_CONF
-    p, cls, conf = p[m], cls[m], conf[m]
-    if len(p) == 0:
-        return []
-    cx, cy, w, h = p[:, 0], p[:, 1], p[:, 2], p[:, 3]
-    xyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], 1)
-    keep = _nms(xyxy + cls[:, None] * 4096.0, conf, YOLO_IOU)   # class-aware NMS
-    dets = []
-    for i in keep:
-        x1 = float(np.clip((xyxy[i, 0] - px) / r, 0, W)); y1 = float(np.clip((xyxy[i, 1] - py) / r, 0, H))
-        x2 = float(np.clip((xyxy[i, 2] - px) / r, 0, W)); y2 = float(np.clip((xyxy[i, 3] - py) / r, 0, H))
-        dets.append({"class": _yolo_names_map.get(int(cls[i]), f"class_{int(cls[i])}"),
-                     "confidence": round(float(conf[i]), 4),
-                     "box_xyxy": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)]})
-    return dets
+
+    if p.shape[1] == 6 and p.shape[0] > 6:       # end-to-end export (nms=True): [x1,y1,x2,y2,conf,cls]
+        m = p[:, 4] >= YOLO_CONF
+        xyxy, conf, cls = p[m, :4], p[m, 4], p[m, 5].astype(int)
+        max_conf, nc = float(p[:, 4].max()) if len(p) else 0.0, int(max(cls.max() + 1, 1)) if len(cls) else 1
+    else:                                        # raw export: (4+nc, N) -> (N, 4+nc)
+        if p.shape[0] < p.shape[1]:
+            p = p.T
+        scores = p[:, 4:]
+        nc = scores.shape[1]
+        cls_all, conf_all = scores.argmax(1), scores.max(1)
+        max_conf = float(conf_all.max()) if len(conf_all) else 0.0
+        m = conf_all >= YOLO_CONF
+        q, cls, conf = p[m], cls_all[m], conf_all[m]
+        if len(q) == 0:
+            return [], 0, max_conf
+        cx, cy, w, h = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        xyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], 1)
+        keep = _nms(xyxy + cls[:, None] * 4096.0, conf, YOLO_IOU)   # class-aware NMS
+        xyxy, conf, cls = xyxy[keep], conf[keep], cls[keep]
+
+    xyxy = (xyxy - np.array([left, top, left, top], dtype=np.float32)) / r      # back to original pixels
+    xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clip(0, W)
+    xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clip(0, H)
+    dets, n_target = [], 0
+    for b, c, k in zip(xyxy, conf, cls):
+        k = int(k)
+        tgt = _is_target(k, nc, S["names"])
+        n_target += int(tgt)
+        dets.append({"class": S["names"].get(k, "amastigote" if tgt else f"class_{k}"),
+                     "confidence": round(float(c), 4),
+                     "box_xyxy": [round(float(v), 1) for v in b]})
+    return dets, n_target, max_conf
 
 
 def predict_parasite(images):
-    """images: one image or a list of 1-5 Giemsa fields. Aggregates across all fields."""
+    """images: one image or a list of 1-5 Giemsa slides (paths / bytes / PIL). Aggregates across all slides."""
     if not isinstance(images, (list, tuple)):
         images = [images]
-    images = list(images)[:MAX_FIELDS]
-    per_slide, all_dets = [], []
-    for idx, im in enumerate(images, start=1):
-        dets = _detect_field(im)
-        n = sum(1 for d in dets if d["class"].lower() == "amastigote")
+    per_slide, max_conf, all_dets = [], [], []
+    for idx, im in enumerate(list(images)[:MAX_FIELDS], start=1):
+        dets, n, mc = _detect_field(im)
         per_slide.append(n)
+        max_conf.append(round(mc, 4))
+        print(f"[slide {idx}] detections={len(dets)} amastigotes={n} max_conf={mc:.4f}", flush=True)
         for d in sorted(dets, key=lambda d: -d["confidence"])[:MAX_DETS_PER_FIELD]:
             all_dets.append({"slide": idx, **d})
-    return sum(per_slide), per_slide, all_dets
+    return sum(per_slide), per_slide, max_conf, all_dets
 
 
 def predict(lesion_image, microscopy_images):
     p = predict_lesion(lesion_image)
-    n_amast, per_slide, dets = predict_parasite(microscopy_images)
+    n_amast, per_slide, max_conf, dets = predict_parasite(microscopy_images)
     lesion_yes, parasite_yes = p >= LESION_THRESHOLD, n_amast > 0
     output, next_step = OUTCOMES[(lesion_yes, parasite_yes)]
     return {
         "clinical_lesion": {"present": bool(lesion_yes), "probability": round(float(p), 4), "threshold": LESION_THRESHOLD},
         "parasite_present": {"present": bool(parasite_yes), "amastigote_count": int(n_amast),
                              "slides_analyzed": len(per_slide), "per_slide_counts": per_slide,
-                             "detections": dets},
+                             "per_slide_max_conf": max_conf, "detections": dets},
         "system_output": output,
         "next_step": next_step,
         "disclaimer": "Decision-support tool for research use. Not a substitute for clinical judgement.",
     }
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        sys.exit("usage: python inference.py lesion.jpg slide1.jpg [slide2.jpg ... slide5.jpg]")
+    print(json.dumps(predict(sys.argv[1], sys.argv[2:7]), indent=2))
